@@ -169,7 +169,7 @@ class MainWindow(QMainWindow):
             base_path = sys._MEIPASS
         else:
             base_path = os.path.dirname(__file__)
-        icon_path = os.path.join(base_path, 'logo.ico')
+        icon_path = os.path.join(base_path, 'logo.svg')
         self.setWindowIcon(QIcon(icon_path))
 
     def browse_sar_file(self):

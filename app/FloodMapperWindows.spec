@@ -1,12 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('logo.ico', '.'), ('SegformerJaccardLoss.pth', '.')]
+datas = [('logo.svg', '.'), ('SegformerJaccardLoss.pth', '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('rasterio')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-
 
 a = Analysis(
     ['frontend.py'],
