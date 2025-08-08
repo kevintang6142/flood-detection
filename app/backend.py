@@ -17,6 +17,36 @@ import tempfile
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+class Reporter:
+    def __init__(self):
+        self.progress_callback = None
+        self.last_was_progress = False
+
+    def set_callback(self, cb):
+        if cb is not None:
+            self.progress_callback = cb
+
+    def report(self, message: str):
+        if self.progress_callback:
+            self.progress_callback(message)
+            if message.startswith("PROGRESS:"):
+                self.last_was_progress = True
+            else:
+                self.last_was_progress = False
+            return
+
+        if message.startswith("PROGRESS:"):
+            clean = message.split(":", 1)[1]
+            print(clean, end="\r", flush=True)
+            self.last_was_progress = True
+        else:
+            if self.last_was_progress:
+                print()
+            print(message)
+            self.last_was_progress = False
+
+reporter = Reporter()
+
 COLOR_MAP = {
     (65, 155, 223): 1,   # Water
     (57, 125, 73): 2,    # Trees
@@ -54,25 +84,19 @@ def _get_utm_crs_from_bounds(bounds, src_crs):
 
       
 def convert_tiles_inplace(tile_dir: str, is_mask: bool = False, progress_callback=None):
-    def report(message):
-        if progress_callback: 
-            progress_callback(message)
-        else:
-            if message.startswith("PROGRESS:"):
-                clean_message = message.split(":", 1)[1]
-                print(clean_message, end='\r')
-            else:
-                print(message)
+    reporter.set_callback(progress_callback)
 
     tif_paths = glob.glob(os.path.join(tile_dir, "*.tif"))
-    report(f"Converting tiles in {os.path.basename(tile_dir)}...")
-    
+    reporter.report(f"Converting tiles in {os.path.basename(tile_dir)}...")
+
     total_files = len(tif_paths)
     if total_files == 0:
-        report(f"No .tif files found to convert in {os.path.basename(tile_dir)}.")
+        reporter.report(f"No .tif files found to convert in {os.path.basename(tile_dir)}.")
         return
 
     for i, tif_path in enumerate(tif_paths):
+        reporter.report(f"PROGRESS:Converting {i + 1}/{total_files} tiles...")
+
         with rasterio.open(tif_path) as src:
             arr = src.read()
             h, w = src.height, src.width
@@ -96,20 +120,14 @@ def convert_tiles_inplace(tile_dir: str, is_mask: bool = False, progress_callbac
         cv2.imwrite(png_path, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
         os.remove(tif_path)
 
-        report(f"PROGRESS:Converted {i + 1}/{total_files} tiles.")
-
-    report(f"Finished converting files in {os.path.basename(tile_dir)} to .png")
+    reporter.report(f"Finished converting files in {os.path.basename(tile_dir)} to .png")
 
     
 
 def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: int, tile_height: int, pixel_size_meters: float, base_temp_dir: str, progress_callback=None) -> tuple[str, str, str]:
-    def report(message):
-        if progress_callback: 
-            progress_callback(message)
-        else:
-            print(message)
+    reporter.set_callback(progress_callback)
 
-    report(f"Starting tiling for SAR='{os.path.basename(sar_tif_path)}', optical='{os.path.basename(optical_tif_path)}'")
+    reporter.report(f"Input images: SAR='{os.path.basename(sar_tif_path)}', optical='{os.path.basename(optical_tif_path)}'")
 
     with rasterio.open(sar_tif_path) as sar_src:
         orig_crs = sar_src.crs
@@ -120,12 +138,11 @@ def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: i
         sar_nodata = sar_src.nodata
 
         target_crs = _get_utm_crs_from_bounds(orig_bounds, orig_crs)
-        report(f"Reprojecting SAR from {orig_crs.to_string()} to {target_crs.to_string()} for meter-based tiling.")
+        reporter.report(f"\nReprojecting SAR from {orig_crs.to_string()} to {target_crs.to_string()} for meter-based tiling...")
 
         dst_transform, width, height = calculate_default_transform(
             orig_crs, target_crs, sar_src.width, sar_src.height, *sar_src.bounds, resolution=pixel_size_meters
         )
-        report(f"Reprojected SAR dimensions (pixels): width={width}, height={height}")
 
         sar_reproj = np.zeros((sar_count, height, width), dtype='float32')
         reproject(
@@ -133,11 +150,13 @@ def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: i
             src_transform=orig_transform, src_crs=orig_crs, dst_transform=dst_transform,
             dst_crs=target_crs, resampling=Resampling.nearest
         )
+        reporter.report(f"Reprojected SAR dimensions (pixels): width={width}, height={height}")
 
-        report("Applying Refined Lee filter to reprojected SAR...")
+        reporter.report(f"\nApplying Refined Lee filter to reprojected SAR...")
         for b in range(sar_reproj.shape[0]):
-            report(f"PROGRESS:Filtering band {b+1}/{sar_reproj.shape[0]}")
+            reporter.report(f"PROGRESS:Filtering band {b+1}/{sar_reproj.shape[0]}...")
             sar_reproj[b] = refined_lee(sar_reproj[b], size=7)
+        reporter.report("Refined Lee filter applied.")
 
         left, top = dst_transform.c, dst_transform.f
         right, bottom = left + dst_transform.a * width, top + dst_transform.e * height
@@ -145,23 +164,25 @@ def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: i
         sar_grid_crs = target_crs
         sar_grid_transform = dst_transform
 
-    report("Creating binary mask from SAR minimum area rectangle...")
+    reporter.report(f"\nCreating binary mask from SAR data contours...")
     binary_image = (sar_reproj[0] > 0).astype(np.uint8) * 255
     contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    reporter.report(f"Found {len(contours)} contours in SAR data.")
     binary_mask_reproj = np.zeros_like(binary_image, dtype='uint8')
+
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
-        rect = cv2.minAreaRect(largest_contour)
-        box = cv2.boxPoints(rect)
-        cv2.drawContours(binary_mask_reproj, [np.int_(box)], 0, (255), -1)
-        report("Successfully created mask from bounding rectangle.")
+        
+        cv2.drawContours(binary_mask_reproj, [largest_contour], -1, (255), thickness=cv2.FILLED)
+
+        reporter.report("Successfully created binary mask from the largest contour.")
     else:
-        report("Warning: No contours found in SAR data to create a mask.")
+        reporter.report("Warning: No contours found in SAR data to create a mask.")
 
     tiles_across = math.ceil((sar_proj_bounds.right - sar_proj_bounds.left) / (tile_width * pixel_size_meters))
     tiles_down = math.ceil((sar_proj_bounds.top - sar_proj_bounds.bottom) / (tile_height * pixel_size_meters))
     total_tiles = tiles_across * tiles_down
-    report(f"Computed grid: {tiles_across} tiles across × {tiles_down} tiles down ({total_tiles} total).")
+    reporter.report(f"\nComputed grid: {tiles_across} tiles across × {tiles_down} tiles down ({total_tiles} total).")
 
     sar_out_dir = os.path.join(base_temp_dir, "sar_tiles")
     opt_out_dir = os.path.join(base_temp_dir, "optical_tiles")
@@ -171,9 +192,11 @@ def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: i
     os.makedirs(mask_out_dir, exist_ok=True)
 
     with rasterio.open(optical_tif_path) as opt_src:
-        report(f"Optical CRS: {opt_src.crs.to_string()}, will reproject per tile into {sar_grid_crs.to_string()}.")
+        reporter.report(f"Optical CRS: {opt_src.crs.to_string()}, will reproject per tile into {sar_grid_crs.to_string()}. Beginning tiling...")
         for row in range(tiles_down):
             for col in range(tiles_across):
+                reporter.report(f"PROGRESS:Tiling tile {row * tiles_across + col + 1}/{total_tiles}...")
+
                 tlx = sar_proj_bounds.left + col * (tile_width * pixel_size_meters)
                 tly = sar_proj_bounds.top - row * (tile_height * pixel_size_meters)
                 dst_transform = from_origin(tlx, tly, pixel_size_meters, pixel_size_meters)
@@ -193,15 +216,14 @@ def tile_sar_and_optical(sar_tif_path: str, optical_tif_path: str, tile_width: i
                 reproject(source=binary_mask_reproj, destination=mask_dest, src_transform=sar_grid_transform, src_crs=sar_grid_crs, dst_transform=dst_transform, dst_crs=sar_grid_crs, resampling=Resampling.nearest)
                 with rasterio.open(os.path.join(mask_out_dir, tile_filename), 'w', driver='GTiff', height=tile_height, width=tile_width, count=1, dtype='uint8', crs=sar_grid_crs, transform=dst_transform, nodata=0) as dst:
                     dst.write(mask_dest)
+    reporter.report("Tiling process complete.")
 
-                report(f"PROGRESS:Tiled {row * tiles_across + col + 1}/{total_tiles} tiles.")
-
-    report(f"\nFinished tiling {total_tiles} tiles. Converting to .png...")
+    reporter.report(f"\nConverting all tiles to .png for model input...")
     convert_tiles_inplace(sar_out_dir, is_mask=False, progress_callback=progress_callback)
     convert_tiles_inplace(opt_out_dir, is_mask=False, progress_callback=progress_callback)
     convert_tiles_inplace(mask_out_dir, is_mask=True, progress_callback=progress_callback)
-    
-    report("Tiling and conversion complete.")
+
+    reporter.report("Conversion complete.")
     return sar_out_dir, opt_out_dir, mask_out_dir
 
 class InferenceTransform:
@@ -220,14 +242,10 @@ def mask_to_rgb(mask_tensor):
     return Image.fromarray(rgb_image)
 
 def classify_landcover(input_dir: str, weights_path: str, base_temp_dir: str, progress_callback=None) -> str:
-    def report(message):
-        if progress_callback: 
-            progress_callback(message)
-        else:
-            print(message)
-    
-    report(f"\nStarting land cover classification...")
-    report(f"Using device: {DEVICE}")
+    reporter.set_callback(progress_callback)
+
+    reporter.report(f"\nStarting land cover classification...")
+    reporter.report(f"Using device: {DEVICE}")
 
     num_classes = len(CLASS_LABELS)
     model = smp.Segformer(encoder_name="efficientnet-b7", in_channels=3, classes=num_classes).to(DEVICE)
@@ -241,6 +259,7 @@ def classify_landcover(input_dir: str, weights_path: str, base_temp_dir: str, pr
 
     with torch.no_grad():
         for i, img_path in enumerate(image_files):
+            reporter.report(f"PROGRESS:Processing tile {i + 1}/{len(image_files)}...")
             image = Image.open(img_path).convert("RGB")
             input_tensor = transform(image).unsqueeze(0).to(DEVICE)
             logits = model(input_tensor)
@@ -248,19 +267,14 @@ def classify_landcover(input_dir: str, weights_path: str, base_temp_dir: str, pr
             pred_rgb_image = mask_to_rgb(pred_mask)
             output_path = os.path.join(output_dir, os.path.basename(img_path))
             pred_rgb_image.save(output_path)
-            report(f"PROGRESS:Processed {i + 1}/{len(image_files)} tiles.")
 
-    report(f"Classification finished. Predictions saved to temporary location.")
+    reporter.report(f"Classification finished. Predictions saved to temporary location.")
     return output_dir
 
 def detect_change_dummy(pre_event_dir: str, post_event_dir: str, base_temp_dir: str, progress_callback=None) -> str:
-    def report(message):
-        if progress_callback: 
-            progress_callback(message)
-        else:
-            print(message)
+    reporter.set_callback(progress_callback)
 
-    report("\nStarting dummy change detection...")
+    reporter.report("\nStarting dummy change detection...")
     output_dir = os.path.join(base_temp_dir, "change_detection_predictions")
     os.makedirs(output_dir, exist_ok=True)
     post_event_images = sorted(glob.glob(os.path.join(post_event_dir, "*.png")))
@@ -272,23 +286,21 @@ def detect_change_dummy(pre_event_dir: str, post_event_dir: str, base_temp_dir: 
         with Image.open(post_img_path) as img:
             change_mask = Image.new('RGB', img.size, (255, 255, 255))
         change_mask.save(os.path.join(output_dir, filename))
-    
-    report("Dummy change detection finished.")
+
+    reporter.report("Dummy change detection finished.")
     return output_dir
 
-def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str, output_filename: str, base_temp_dir: str, progress_callback=None) -> str:
-    def report(message):
-        if progress_callback: 
-            progress_callback(message)
-        else:
-            print(message)
-    
-    report("\nStarting final combination and stitching...")
+def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str, base_temp_dir: str, progress_callback=None) -> str:
+    reporter.set_callback(progress_callback)
+
+    reporter.report("\nStarting final combination and stitching...")
     combined_dir = os.path.join(base_temp_dir, "combined_tiles")
     os.makedirs(combined_dir, exist_ok=True)
     lc_tiles = sorted(glob.glob(os.path.join(lc_pred_dir, "*.png")))
 
     for i, lc_path in enumerate(lc_tiles):
+        reporter.report(f"PROGRESS:Combining tile {i + 1}/{len(lc_tiles)}...")
+
         filename = os.path.basename(lc_path)
         cd_path = os.path.join(cd_pred_dir, filename)
         mask_path = os.path.join(mask_dir, filename)
@@ -304,13 +316,13 @@ def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str
         outside_path_mask = np.all(mask_array == [0, 0, 0], axis=-1)
         final_array[outside_path_mask] = [128, 128, 128]
         Image.fromarray(final_array).save(os.path.join(combined_dir, filename))
-        report(f"PROGRESS:Combined {i + 1}/{len(lc_tiles)} tiles.")
-    report("Finished combining tiles. Stitching combined tiles into a single image...")
+    reporter.report("Finished combining tiles.")
+
+    reporter.report(f"\nStitching combined tiles into a single image...")
     combined_tiles = sorted(glob.glob(os.path.join(combined_dir, "*.png")))
     if not combined_tiles:
-        report("No combined tiles were created. Cannot stitch.")
+        reporter.report("No combined tiles were created. Cannot stitch.")
         return ""
-
     tile_coords = [re.match(r"tile_(\d+)_(\d+)\.png", os.path.basename(p)) for p in combined_tiles]
     valid_tiles = [tc.groups() for tc in tile_coords if tc]
     max_row = max(int(r) for r, c in valid_tiles)
@@ -322,33 +334,44 @@ def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str
     full_width = (max_col + 1) * tile_w
     full_height = (max_row + 1) * tile_h
     stitched_image = Image.new('RGB', (full_width, full_height))
-    report(f"Creating a {full_width}x{full_height} canvas...")
+    reporter.report(f"Creating a {full_width}x{full_height} canvas...")
 
     for i, tile_path in enumerate(combined_tiles):
+        reporter.report(f"PROGRESS:Stitching tile {i + 1}/{len(combined_tiles)}...")
+
         match = re.match(r"tile_(\d+)_(\d+)\.png", os.path.basename(tile_path))
         if match:
             row, col = map(int, match.groups())
             with Image.open(tile_path) as tile:
                 stitched_image.paste(tile, (col * tile_w, row * tile_h))
-        report(f"PROGRESS:Stitched {i + 1}/{len(combined_tiles)} tiles.")
 
-    stitched_image.save(output_filename)
-    report(f"Stitching complete. Final output saved to '{output_filename}'.")
-    return output_filename
+    reporter.report("Stitching complete.")
 
+    return stitched_image
+
+def save_stitched_image(stitched_image: Image.Image, output_path: str, progress_callback=None) -> str:
+    reporter.set_callback(progress_callback)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    stitched_image.save(output_path)
+    reporter.report(f"\nFinal output saved to '{output_path}'.")
+    return output_path
 
 def run_flood_mapping_pipeline(
     sar_tif: str,
     optical_tif: str,
     weights_file: str,
-    progress_callback,
+    progress_callback=None,
     tile_width: int = 256,
     tile_height: int = 256,
-    pixel_size_meters: float = 20.0
+    pixel_size_meters: float = 20.0,
+    output_dir: str = None
 ) -> str:
+    reporter.set_callback(progress_callback)
+
     with tempfile.TemporaryDirectory() as temp_dir:
-        progress_callback(f"Created temporary directory: {temp_dir}")
-        
+        reporter.report(f"Created temporary directory: {temp_dir}")
+
         sar_tiles_dir, opt_tiles_dir, mask_tiles_dir = tile_sar_and_optical(
             sar_tif, optical_tif, tile_width, tile_height, pixel_size_meters,
             base_temp_dir=temp_dir, progress_callback=progress_callback
@@ -363,38 +386,47 @@ def run_flood_mapping_pipeline(
             pre_event_dir=opt_tiles_dir, post_event_dir=sar_tiles_dir,
             base_temp_dir=temp_dir, progress_callback=progress_callback
         )
-
-        output_dir = os.path.dirname(sar_tif)
-        final_output_filename = os.path.join(
-            output_dir,
-            os.path.splitext(os.path.basename(sar_tif))[0] + "_final_flood_map.png"
-        )
         
-        final_path = combine_and_stitch_results(
+        stitched_image = combine_and_stitch_results(
             lc_pred_dir=lc_pred_dir, cd_pred_dir=cd_pred_dir,
-            mask_dir=mask_tiles_dir, output_filename=final_output_filename,
-            base_temp_dir=temp_dir, progress_callback=progress_callback
+            mask_dir=mask_tiles_dir, base_temp_dir=temp_dir,
+            progress_callback=progress_callback
         )
 
-        progress_callback("\nPipeline finished successfully!")
-        return final_path
+        if output_dir:
+            base_name = os.path.splitext(os.path.basename(sar_tif))[0] + '_flood_map.png'
+            final_output = os.path.join(output_dir, base_name)
+            save_stitched_image(stitched_image, final_output, progress_callback)
+            reporter.report("\nPipeline finished successfully!")
+            return final_output
+        else:
+            reporter.report("\nPipeline finished successfully! No output_dir provided, returning image object.")
+            return stitched_image
     
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Detect flooded areas using SAR and optical imagery and classify land cover in the affected regions.")
+    parser = argparse.ArgumentParser(
+        description="Detect flooded areas using SAR and optical imagery and classify land cover in the affected regions."
+    )
     parser.add_argument("sar_tif", help="Path to the SAR (flight path) .tif")
     parser.add_argument("optical_tif", help="Path to the optical .tif")
     parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth)")
     parser.add_argument("--tile-width", type=int, default=256, help="Tile width in pixels")
     parser.add_argument("--tile-height", type=int, default=256, help="Tile height in pixels")
     parser.add_argument("--pixel-size-meters", type=float, default=20.0, help="Pixel size in meters (unit of CRS)")
+    parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory to save the final flood map image")
     args = parser.parse_args()
 
-    final_map_path = run_flood_mapping_pipeline(
+    final_map = run_flood_mapping_pipeline(
         sar_tif=args.sar_tif,
         optical_tif=args.optical_tif,
         weights_file=args.weights_file,
+        progress_callback=None,
         tile_width=args.tile_width,
         tile_height=args.tile_height,
-        pixel_size_meters=args.pixel_size_meters
+        pixel_size_meters=args.pixel_size_meters,
+        output_dir=args.output_dir
     )
+    
+    if not isinstance(final_map, str):
+        final_map.show()

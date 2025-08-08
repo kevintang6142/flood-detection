@@ -1,5 +1,8 @@
 .venv/
 .vscode/
 __pycache__/
+build/
+dist/
+
 __MACOSX/
 .DS_Store
