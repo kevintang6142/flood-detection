@@ -20,32 +20,37 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
     a.scripts,
-    exclude_binaries=True,
+    a.binaries,
+    a.datas,
+    [],
     name='FloodMapper',
     debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    runtime_tmpdir=None,
     console=False,
+    disable_windowed_traceback=False,
     argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
 )
 
 app = BUNDLE(
     exe,
     name='FloodMapper.app',
     icon='logo.icns',
-    bundle_identifier='com.reu.floodmapper'
-)
-
-coll = COLLECT(
-    app,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    name='FloodMapper'
+    bundle_identifier='com.reu.floodmapper',
+    info_plist={
+        'NSPrincipalClass': 'NSApplication',
+        'NSAppleScriptEnabled': False,
+        'CFBundleDocumentTypes': [],
+    }
 )
