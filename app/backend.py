@@ -14,6 +14,11 @@ from PIL import Image
 import torchvision.transforms.functional as TF
 import re
 import tempfile
+import io
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -59,6 +64,15 @@ COLOR_MAP = {
 
 CLASS_LABELS = [1, 2, 4, 5, 7, 8, 11]
 INDEX_TO_COLOR = {v: k for k, v in COLOR_MAP.items()}
+CLASS_ID_TO_LABEL = {
+    1: "Water",
+    2: "Trees",
+    4: "Flooded Vegetation",
+    5: "Crops",
+    7: "Built Area",
+    8: "Bare Ground",
+    11: "Rangeland",
+}
 
 def refined_lee(img, size=7):
     img = img.astype('float32')
@@ -311,10 +325,14 @@ def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str
         mask_array = np.array(Image.open(mask_path).convert("RGB"))
 
         final_array = lc_array.copy()
-        not_flooded_mask = np.all(cd_array == [0, 0, 0], axis=-1)
-        final_array[not_flooded_mask] = [0, 0, 0]
+        is_flooded_mask = np.any(cd_array != [0, 0, 0], axis=-1)
+        
+        final_array = np.zeros_like(lc_array)
+        final_array[is_flooded_mask] = lc_array[is_flooded_mask]
+        
         outside_path_mask = np.all(mask_array == [0, 0, 0], axis=-1)
         final_array[outside_path_mask] = [128, 128, 128]
+        
         Image.fromarray(final_array).save(os.path.join(combined_dir, filename))
     reporter.report("Finished combining tiles.")
 
@@ -352,10 +370,162 @@ def combine_and_stitch_results(lc_pred_dir: str, cd_pred_dir: str, mask_dir: str
 def save_stitched_image(stitched_image: Image.Image, output_path: str, progress_callback=None) -> str:
     reporter.set_callback(progress_callback)
 
+    if not isinstance(stitched_image, Image.Image):
+        reporter.report("Warning: Cannot save stitched map, as the provided input is not a valid image object.")
+        return None
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     stitched_image.save(output_path)
     reporter.report(f"\nFinal output saved to '{output_path}'.")
     return output_path
+
+def save_legend_image(legend_image: Image.Image, output_path: str, progress_callback=None) -> str:
+    reporter.set_callback(progress_callback)
+
+    if not isinstance(legend_image, Image.Image):
+        reporter.report("Warning: Cannot save legend, as the provided input is not a valid image object.")
+        return None
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    legend_image.save(output_path)
+    reporter.report(f"Legend saved to '{output_path}'.")
+    return output_path
+
+def calculate_statistics(stitched_image: Image.Image, pixel_size_meters: float) -> dict:
+    reporter.report("\nCalculating final statistics...")
+    if not isinstance(stitched_image, Image.Image):
+        reporter.report("Error: Input is not a valid PIL Image. Cannot calculate stats.")
+        return {}
+
+    image_array = np.array(stitched_image.convert("RGB"))
+    
+    pixel_area_m2 = pixel_size_meters * pixel_size_meters
+    m2_to_km2 = 1 / 1_000_000
+
+    grey_color = np.array([128, 128, 128])
+    black_color = np.array([0, 0, 0])
+
+    is_grey_mask = np.all(image_array == grey_color, axis=-1)
+    flight_path_mask = ~is_grey_mask
+    total_path_pixels = np.sum(flight_path_mask)
+    
+    is_black_mask = np.all(image_array == black_color, axis=-1)
+    
+    non_flooded_pixels = np.sum(is_black_mask & flight_path_mask)
+    total_flooded_pixels = total_path_pixels - non_flooded_pixels
+
+    stats = {
+        "total_flight_path_area_km2": total_path_pixels * pixel_area_m2 * m2_to_km2,
+        "total_flooded_area_km2": total_flooded_pixels * pixel_area_m2 * m2_to_km2,
+        "total_non_flooded_area_km2": non_flooded_pixels * pixel_area_m2 * m2_to_km2,
+    }
+
+    land_cover_stats = {}
+    for class_id, color_rgb in INDEX_TO_COLOR.items():
+        class_label = CLASS_ID_TO_LABEL.get(class_id, f"Unknown Class {class_id}")
+        color_np = np.array(list(color_rgb))
+        
+        class_mask = np.all(image_array == color_np, axis=-1) & flight_path_mask
+        pixel_count = np.sum(class_mask)
+        
+        area_km2 = pixel_count * pixel_area_m2 * m2_to_km2
+        land_cover_stats[class_label] = area_km2
+
+    stats["land_cover_areas_km2"] = land_cover_stats
+    reporter.report("Statistics calculation complete.")
+    
+    return stats
+
+def generate_legend_image(stats: dict) -> Image.Image:
+    reporter.report("\nGenerating legend image...")
+    if not stats:
+        return None
+
+    total_area = stats.get("total_flight_path_area_km2", 0)
+    flooded_area = stats.get("total_flooded_area_km2", 0)
+    non_flooded_area = stats.get("total_non_flooded_area_km2", 0)
+    land_cover_areas = stats.get("land_cover_areas_km2", {})
+
+    sorted_land_cover = sorted(
+        [(k, v) for k, v in land_cover_areas.items() if v > 0.001],
+        key=lambda item: item[1],
+        reverse=True
+    )
+    
+    label_to_id = {v: k for k, v in CLASS_ID_TO_LABEL.items()}
+
+    row_height = 0.35
+    header_space = 0.6
+    num_items = 3 + len(sorted_land_cover)
+    fig_height = (num_items + 2) * row_height
+    fig_width = 4.8
+
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=100)
+    fig.patch.set_facecolor('#FAFAFA')
+    ax.set_facecolor('#FAFAFA')
+    ax.axis('off')
+
+    y_pos = fig_height - header_space
+
+    def draw_row(label, value=None, color=None, bold=False):
+        nonlocal y_pos
+        rect_height = 0.25
+        if color:
+            rect = mpatches.Rectangle(
+                (0.2, y_pos - rect_height / 2),
+                0.25, rect_height,
+                facecolor=color,
+                edgecolor='black',
+                linewidth=0.5
+            )
+            ax.add_patch(rect)
+            text_x = 0.55
+        else:
+            text_x = 0.2
+
+        ax.text(text_x, y_pos, label,
+                ha='left', va='center', fontsize=9,
+                weight='bold' if bold else 'normal')
+
+        if value is not None:
+            ax.text(fig_width - 0.2, y_pos, f"{value:.2f} km²",
+                    ha='right', va='center', fontsize=9,
+                    weight='bold' if bold else 'normal')
+
+        y_pos -= row_height
+
+
+    draw_row("Total Area (Flight Path)", total_area, bold=True)
+    draw_row("Total Flooded Area", flooded_area, bold=True)
+
+    draw_row("Non-Flooded Area", non_flooded_area, color="#000000")
+
+    y_pos -= 0.15
+    ax.plot([0.2, fig_width - 0.2], [y_pos, y_pos], color='#AAA', linewidth=0.5)
+    y_pos -= 0.25
+
+    if sorted_land_cover:
+        y_pos -= 0.2
+        ax.text(fig_width / 2, y_pos, "Flooded Land Cover Breakdown",
+                ha='center', va='center', fontsize=9, style='italic', color='#000000')
+        y_pos -= row_height
+
+        for label, area in sorted_land_cover:
+            class_id = label_to_id.get(label)
+            if class_id:
+                rgb = INDEX_TO_COLOR.get(class_id)
+                if rgb:
+                    color_hex = '#%02x%02x%02x' % rgb
+                    draw_row(label, area, color=color_hex)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0.25, facecolor=fig.get_facecolor())
+    buf.seek(0)
+    legend_image = Image.open(buf)
+    plt.close(fig)
+
+    reporter.report("Legend image generated.")
+    return legend_image
 
 def run_flood_mapping_pipeline(
     sar_tif: str,
@@ -366,12 +536,14 @@ def run_flood_mapping_pipeline(
     tile_height: int = 256,
     pixel_size_meters: float = 20.0,
     output_dir: str = None
-) -> str:
+) -> tuple:
     reporter.set_callback(progress_callback)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         reporter.report(f"Created temporary directory: {temp_dir}")
 
+        stitched_image, legend_image = None, None
+        
         sar_tiles_dir, opt_tiles_dir, mask_tiles_dir = tile_sar_and_optical(
             sar_tif, optical_tif, tile_width, tile_height, pixel_size_meters,
             base_temp_dir=temp_dir, progress_callback=progress_callback
@@ -393,15 +565,28 @@ def run_flood_mapping_pipeline(
             progress_callback=progress_callback
         )
 
+        if isinstance(stitched_image, Image.Image):
+            stats = calculate_statistics(stitched_image, pixel_size_meters)
+            if stats:
+                legend_image = generate_legend_image(stats)
+        
         if output_dir:
-            base_name = os.path.splitext(os.path.basename(sar_tif))[0] + '_flood_map.png'
-            final_output = os.path.join(output_dir, base_name)
-            save_stitched_image(stitched_image, final_output, progress_callback)
+            final_output_path, legend_output_path = None, None
+            if stitched_image:
+                base_name = os.path.splitext(os.path.basename(sar_tif))[0] + '_flood_map.png'
+                final_output_path = os.path.join(output_dir, base_name)
+                save_stitched_image(stitched_image, final_output_path, progress_callback)
+            
+            if legend_image:
+                legend_base_name = os.path.splitext(os.path.basename(sar_tif))[0] + '_legend.png'
+                legend_output_path = os.path.join(output_dir, legend_base_name)
+                save_legend_image(legend_image, legend_output_path, progress_callback)
+            
             reporter.report("\nPipeline finished successfully!")
-            return final_output
+            return (final_output_path, legend_output_path)
         else:
-            reporter.report("\nPipeline finished successfully! No output_dir provided, returning image object.")
-            return stitched_image
+            reporter.report("\nPipeline finished successfully! No output_dir provided, returning image objects.")
+            return (stitched_image, legend_image)
     
 if __name__ == "__main__":
     import argparse
@@ -411,22 +596,20 @@ if __name__ == "__main__":
     parser.add_argument("sar_tif", help="Path to the SAR (flight path) .tif")
     parser.add_argument("optical_tif", help="Path to the optical .tif")
     parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth)")
-    parser.add_argument("--tile-width", type=int, default=256, help="Tile width in pixels")
-    parser.add_argument("--tile-height", type=int, default=256, help="Tile height in pixels")
-    parser.add_argument("--pixel-size-meters", type=float, default=20.0, help="Pixel size in meters (unit of CRS)")
     parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory to save the final flood map image")
     args = parser.parse_args()
 
-    final_map = run_flood_mapping_pipeline(
+    final_map, legend_map = run_flood_mapping_pipeline(
         sar_tif=args.sar_tif,
         optical_tif=args.optical_tif,
         weights_file=args.weights_file,
-        progress_callback=None,
-        tile_width=args.tile_width,
-        tile_height=args.tile_height,
-        pixel_size_meters=args.pixel_size_meters,
         output_dir=args.output_dir
     )
     
-    if not isinstance(final_map, str):
-        final_map.show()
+    if args.output_dir:
+        print(f"Outputs saved: Map='{final_map}', Legend='{legend_map}'")
+    else:
+        if final_map:
+            final_map.show()
+        if legend_map:
+            legend_map.show()

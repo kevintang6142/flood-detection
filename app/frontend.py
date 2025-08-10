@@ -3,7 +3,8 @@ import os
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QFileDialog, QTextEdit, QMessageBox,
-    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QStackedLayout
+    QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QStackedLayout,
+    QScrollArea, QFrame
 )
 from PySide6.QtCore import Qt, QThread, Signal, QRectF
 from PySide6.QtGui import QPixmap, QTextCursor, QIcon
@@ -13,7 +14,7 @@ import backend
 
 class Worker(QThread):
     progress = Signal(str)
-    finished = Signal(object)
+    finished = Signal(tuple)
     error = Signal(str)
 
     def __init__(self, sar_path, optical_path, weights_path):
@@ -24,14 +25,14 @@ class Worker(QThread):
 
     def run(self):
         try:
-            result_image = backend.run_flood_mapping_pipeline(
+            result_tuple = backend.run_flood_mapping_pipeline(
                 sar_tif=self.sar_path,
                 optical_tif=self.optical_path,
                 weights_file=self.weights_path,
                 progress_callback=self.progress.emit,
                 output_dir=None
             )
-            self.finished.emit(result_image)
+            self.finished.emit(result_tuple)
         except Exception as e:
             self.error.emit(f"An error occurred: {e}\n\nCheck console for more details.")
             import traceback
@@ -56,10 +57,15 @@ class ImageViewer(QGraphicsView):
 
     def set_image(self, pixmap):
         self.clear_image()
-        self._pixmap_item.setPixmap(pixmap)
-        self._scene.setSceneRect(pixmap.rect())
-        self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
         self._zoom_level = 0
+        self._pixmap_item.setPixmap(pixmap)
+        self._scene.setSceneRect(self._pixmap_item.boundingRect())
+        self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
+        
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._zoom_level == 0 and not self._pixmap_item.pixmap().isNull():
+            self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
 
     def wheelEvent(self, event):
         if self._pixmap_item.pixmap().isNull():
@@ -72,7 +78,7 @@ class ImageViewer(QGraphicsView):
             factor, self._zoom_level = zoom_out, self._zoom_level - 1
 
         if self._zoom_level < 0:
-            self.fitInView(self._scene.sceneRect(), Qt.KeepAspectRatio)
+            self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
             self._zoom_level = 0
         else:
             self.scale(factor, factor)
@@ -80,10 +86,10 @@ class ImageViewer(QGraphicsView):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Flood Mapper")
-        self.setGeometry(100, 100, 900, 700)
+        self.setWindowTitle("FloodMapper")
 
         self.result_image: Image | None = None
+        self.legend_image: Image | None = None
 
         self.sar_path_edit = QLineEdit(self)
         self.sar_path_edit.setPlaceholderText("Path to SAR TIF file...")
@@ -102,15 +108,27 @@ class MainWindow(QMainWindow):
         self.run_btn.clicked.connect(self.run_analysis)
         self.run_btn.setEnabled(False)
 
-        self.save_as_btn = QPushButton("Save Result As...")
+        self.save_as_btn = QPushButton("Save Results...")
         self.save_as_btn.setStyleSheet("font-size: 16px; padding: 10px;")
-        self.save_as_btn.clicked.connect(self.save_image_as)
+        self.save_as_btn.clicked.connect(self.save_results)
         self.save_as_btn.setEnabled(False)
 
         self.progress_log = QTextEdit(self)
         self.progress_log.setReadOnly(True)
         self.progress_log.setLineWrapMode(QTextEdit.NoWrap)
+        
+        self.stats_legend_label = QLabel("Analysis statistics and legend will appear here.")
+        self.stats_legend_label.setAlignment(Qt.AlignCenter)
+        self.stats_legend_label.setStyleSheet("color: gray;")
+        self.stats_legend_label.setWordWrap(True)
 
+        self.stats_scroll_area = QScrollArea()
+        self.stats_scroll_area.setWidgetResizable(True)
+        self.stats_scroll_area.setWidget(self.stats_legend_label)
+        self.stats_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.stats_scroll_area.setLineWidth(0)
+        self.stats_scroll_area.setMidLineWidth(0)
+        
         self.image_viewer = ImageViewer()
         self.image_viewer.setMinimumSize(400, 400)
 
@@ -122,8 +140,10 @@ class MainWindow(QMainWindow):
         self.view_stack_layout.addWidget(self.image_viewer)
         self.view_stack_layout.addWidget(self.placeholder_label)
 
-        view_container = QWidget()
-        view_container.setLayout(self.view_stack_layout)
+        self.view_container = QWidget()
+        self.view_container.setLayout(self.view_stack_layout)
+        
+        self.set_border_style(active=True)
 
         root_layout = QVBoxLayout()
 
@@ -150,10 +170,12 @@ class MainWindow(QMainWindow):
         left_layout.addLayout(file_selection_layout)
         left_layout.addLayout(controls_layout)
         left_layout.addWidget(QLabel("Log:"))
-        left_layout.addWidget(self.progress_log)
+        left_layout.addWidget(self.progress_log, 2)
+        left_layout.addWidget(QLabel("Statistics & Legend:"))
+        left_layout.addWidget(self.stats_scroll_area, 3)
 
         main_layout.addLayout(left_layout, 1)
-        main_layout.addWidget(view_container, 1)
+        main_layout.addWidget(self.view_container, 2)
 
         root_layout.addLayout(main_layout)
 
@@ -171,6 +193,14 @@ class MainWindow(QMainWindow):
             base_path = os.path.dirname(__file__)
         icon_path = os.path.join(base_path, 'logo.svg')
         self.setWindowIcon(QIcon(icon_path))
+
+    def set_border_style(self, active: bool):
+        if active:
+            style = "border: 1px solid #c0c0c0; border-radius: 2px;"
+        else:
+            style = "border: none;"
+        self.view_container.setStyleSheet(style)
+        self.stats_scroll_area.viewport().setStyleSheet(style)
 
     def browse_sar_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "Select SAR TIF File", "", "TIF Files (*.tif *.tiff)")
@@ -193,6 +223,12 @@ class MainWindow(QMainWindow):
         self.save_as_btn.setEnabled(False)
         self.run_btn.setText("Processing...")
         self.progress_log.clear()
+        
+        self.set_border_style(active=True)
+
+        self.stats_legend_label.setPixmap(QPixmap())
+        self.stats_legend_label.setText("Processing, please wait…")
+        self.stats_legend_label.setAlignment(Qt.AlignCenter)
 
         self.placeholder_label.setText("Processing, please wait…")
         self.view_stack_layout.setCurrentWidget(self.placeholder_label)
@@ -200,6 +236,7 @@ class MainWindow(QMainWindow):
         
         self.last_line_is_progress = False
         self.result_image = None
+        self.legend_image = None
 
         sar_path = self.sar_path_edit.text()
         optical_path = self.optical_path_edit.text()
@@ -222,21 +259,25 @@ class MainWindow(QMainWindow):
         self.worker.error.connect(self.show_error)
         self.worker.start()
 
-    def save_image_as(self):
-        if not self.result_image:
-            QMessageBox.warning(self, "No Image", "There is no analysis result to save.")
+    def save_results(self):
+        if not (self.result_image and self.legend_image):
+            QMessageBox.warning(self, "No Results", "There are no analysis results to save.")
             return
 
-        default_name = os.path.splitext(os.path.basename(self.sar_path_edit.text()))[0] + "_flood_map.png"
-        
-        save_path, _ = QFileDialog.getSaveFileName(self, "Save Image As", default_name, "PNG Files (*.png);;All Files (*)")
+        save_dir = QFileDialog.getExistingDirectory(self, "Select Directory to Save Results")
 
-        if save_path:
+        if save_dir:
             try:
-                backend.save_stitched_image(self.result_image, save_path, self.update_progress)
-                QMessageBox.information(self, "Success", f"Image successfully saved to:\n{save_path}")
+                base_name = os.path.splitext(os.path.basename(self.sar_path_edit.text()))[0]
+                map_path = os.path.join(save_dir, f"{base_name}_flood_map.png")
+                legend_path = os.path.join(save_dir, f"{base_name}_legend.png")
+
+                self.result_image.save(map_path)
+                self.legend_image.save(legend_path)
+
+                QMessageBox.information(self, "Success", f"Results successfully saved to:\n{save_dir}")
             except Exception as e:
-                self.show_error(f"Failed to save image: {e}")
+                self.show_error(f"Failed to save results: {e}")
 
     def update_progress(self, message):
         if message.startswith("PROGRESS:"):
@@ -256,22 +297,45 @@ class MainWindow(QMainWindow):
 
         self.progress_log.ensureCursorVisible()
 
-    def analysis_finished(self, result_image):
+    def analysis_finished(self, result_tuple):
         self.run_btn.setText("Run Analysis")
         self.check_inputs()
         
+        result_image, legend_image = result_tuple if result_tuple else (None, None)
+
         if isinstance(result_image, Image):
             self.update_progress("Backend processing complete.")
             pixmap = result_image.toqpixmap()
             self.image_viewer.set_image(pixmap)
             self.view_stack_layout.setCurrentWidget(self.image_viewer)
             self.result_image = result_image
-            self.save_as_btn.setEnabled(True)
+            
+            self.set_border_style(active=False)
+
+            if isinstance(legend_image, Image):
+                self.legend_image = legend_image
+                legend_pixmap = legend_image.toqpixmap()
+                
+                scaled_pixmap = legend_pixmap.scaledToHeight(
+                    self.stats_scroll_area.height() - 15,
+                    Qt.TransformationMode.SmoothTransformation
+                )
+                self.stats_legend_label.setPixmap(scaled_pixmap)
+                self.stats_legend_label.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+                self.save_as_btn.setEnabled(True)
+            else:
+                self.stats_legend_label.setText("Could not generate legend.")
+                self.stats_legend_label.setAlignment(Qt.AlignCenter)
+
         else:
             self.placeholder_label.setText("Analysis finished with no result, or an error occurred.")
             self.view_stack_layout.setCurrentWidget(self.placeholder_label)
             self.result_image = None
+            self.legend_image = None
             self.save_as_btn.setEnabled(False)
+            self.stats_legend_label.setText("Analysis failed.")
+            self.stats_legend_label.setAlignment(Qt.AlignCenter)
+            self.set_border_style(active=True)
 
     def show_error(self, error_message):
         self.progress_log.append(f"\nERROR: {error_message}\n")
@@ -282,5 +346,5 @@ class MainWindow(QMainWindow):
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
