@@ -594,9 +594,9 @@ if __name__ == "__main__":
         description="Detect flooded areas using SAR and optical imagery and classify land cover in the affected regions."
     )
     parser.add_argument("sar_tif", help="Path to the SAR (flight path) .tif")
-    parser.add_argument("optical_tif", help="Path to the optical .tif")
-    parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth)")
-    parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory to save the final flood map image")
+    parser.add_argument("optical_tif", help="Path to the optical GeoTIFF for the same area.")
+    parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth).")
+    parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory where outputs will be saved. If provided, two PNGs are written: a stitched flood map and a legend. If omitted, the CLI will display the images.")
     args = parser.parse_args()
 
     final_map, legend_map = run_flood_mapping_pipeline(
