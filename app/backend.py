@@ -842,6 +842,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("sar_tif", help="Path to the SAR (flight path) .tif")
 <<<<<<< HEAD
+<<<<<<< HEAD
     parser.add_argument("optical_tif", help="Path to the optical .tif")
     parser.add_argument(
         "weights_file",
@@ -858,6 +859,11 @@ if __name__ == "__main__":
     parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth).")
     parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory where outputs will be saved. If provided, two PNGs are written: a stitched flood map and a legend. If omitted, the CLI will display the images.")
 >>>>>>> 2c28bf5048268c476b3be52637d6e1de8b59e45e
+=======
+    parser.add_argument("optical_tif", help="Path to the optical .tif")
+    parser.add_argument("weights_file", help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth)")
+    parser.add_argument("--output-dir", dest="output_dir", default=None, help="Directory to save the final flood map image")
+>>>>>>> parent of 2c28bf504 (Add README and license info)
     args = parser.parse_args()
 
     final_map, legend_map = run_flood_mapping_pipeline(
