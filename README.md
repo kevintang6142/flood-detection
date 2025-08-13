@@ -1,6 +1,6 @@
 # FloodMapper
 
-Placeholder for Abstract
+We present research to detect flooding changes in NASA’s Uninhabited Aerial Vehicle Synthetic Aperture Radar (UAVSAR) imagery using deep learning, and to classify the land cover types affected by these floods. First, a binary change detection model is used to identify flooded areas by comparing pre-event optical data and post-event UAVSAR data. Next, the regions are classified by land cover category to determine what types of terrain experienced the most inundation. The outcome is an integrated flood mapping and land cover analysis tool, which is important for decisions regarding where priority disaster response is dispatched and for land use analysis. This tool provides timely flood extent maps regardless of weather or daylight conditions and helps to understand which land covers and communities are impacted by flooding to aid in recovery efforts, where to develop preventative infrastructure, and future urban planning. The work builds on state-of-the-art deep learning methods for image segmentation and leverage geospatial data platforms to efficiently handle large remote sensing datasets. We train and test the models on UAVSAR data, and the models achieve 90.0\%, pixel accuracy for change detection and 86.1\% pixel accuracy for land cover classification. 
 
 ## Download
 
