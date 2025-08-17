@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from models.help_funcs import RCSA
+from .help_funcs import RCSA
 
 
 def gauss_kernel(channels=3, device=None):

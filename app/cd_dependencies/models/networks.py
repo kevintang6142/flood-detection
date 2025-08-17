@@ -7,15 +7,15 @@ from einops import rearrange
 from torch.nn import init
 from torch.optim import lr_scheduler
 from torchvision.transforms.functional import rgb_to_grayscale
-from Unet.unetPlusPlus import unetPlusPlus
+from ..Unet.unetPlusPlus import unetPlusPlus
 
-import models
-from models.aspp import RCSA_ASPP
-from models.ELGCA import ELGCA
-from models.FUSE import DFIM
-from models.help_funcs import RCSA, Transformer, TransformerDecoder, TwoLayerConv2d
-from models.laplace import make_laplace_pyramid
-from models.MFDS import MDPM
+from .resnet import *
+from .aspp import RCSA_ASPP
+from .ELGCA import ELGCA
+from .FUSE import DFIM
+from .help_funcs import RCSA, Transformer, TransformerDecoder, TwoLayerConv2d
+from .laplace import make_laplace_pyramid
+from .MFDS import MDPM
 
 ###############################################################################
 # Helper Functions
@@ -184,18 +184,18 @@ class ResNet(torch.nn.Module):
         super(ResNet, self).__init__()
         expand = 1
         if backbone == "resnet18":
-            self.resnet = models.resnet18(
+            self.resnet = resnet18(
                 nc=input_nc,
                 pretrained=True,
                 replace_stride_with_dilation=[False, True, True],
             )  # 用扩张代替步幅
 
         elif backbone == "resnet34":
-            self.resnet = models.resnet34(
+            self.resnet = resnet34(
                 pretrained=True, replace_stride_with_dilation=[False, True, True]
             )
         elif backbone == "resnet50":
-            self.resnet = models.resnet50(
+            self.resnet = resnet50(
                 pretrained=True, replace_stride_with_dilation=[False, True, True]
             )
             expand = 4

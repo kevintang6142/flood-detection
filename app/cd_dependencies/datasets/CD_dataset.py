@@ -5,7 +5,7 @@
 import os
 
 import numpy as np
-from datasets.data_utils import CDDataAugmentation
+from .data_utils import CDDataAugmentation
 from PIL import Image
 from torch.utils import data
 

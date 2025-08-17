@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('logo.svg', '.'), ('SegformerJaccardLoss.pth', '.')]
+datas = [('logo.svg', '.'), ('SegformerJaccardLoss.pth', '.'), ('ganmodel.pth', '.'), ('changemodel.pt', '.'),]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('rasterio')

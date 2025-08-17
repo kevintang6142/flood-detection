@@ -17,18 +17,22 @@ class Worker(QThread):
     finished = Signal(tuple)
     error = Signal(str)
 
-    def __init__(self, sar_path, optical_path, weights_path):
+    def __init__(self, sar_path, optical_path, lc_weights_path, gan_weights_path, cd_weights_path):
         super().__init__()
         self.sar_path = sar_path
         self.optical_path = optical_path
-        self.weights_path = weights_path
+        self.lc_weights_path = lc_weights_path
+        self.gan_weights_path = gan_weights_path
+        self.cd_weights_path = cd_weights_path
 
     def run(self):
         try:
             result_tuple = backend.run_flood_mapping_pipeline(
                 sar_tif=self.sar_path,
                 optical_tif=self.optical_path,
-                weights_file=self.weights_path,
+                lc_weights_file=self.lc_weights_path,
+                gan_weights_file=self.gan_weights_path,
+                cd_weights_file=self.cd_weights_path,
                 progress_callback=self.progress.emit,
                 output_dir=None
             )
@@ -241,19 +245,30 @@ class MainWindow(QMainWindow):
         sar_path = self.sar_path_edit.text()
         optical_path = self.optical_path_edit.text()
 
-        if getattr(sys, 'frozen', False):
-            base_path = sys._MEIPASS
-        else:
-            base_path = os.path.dirname(__file__)
+        try:
+            if getattr(sys, 'frozen', False):
+                base_path = sys._MEIPASS
+            else:
+                base_path = os.path.dirname(__file__)
 
-        weights_path = os.path.join(base_path, 'SegformerJaccardLoss.pth')
+            lc_weights_path = os.path.join(base_path, 'SegformerJaccardLoss.pth')
+            gan_weights_path = os.path.join(base_path, 'ganmodel.pth')
+            cd_weights_path = os.path.join(base_path, 'changemodel.pt')
 
-        if not os.path.exists(weights_path):
-            self.show_error(f"FATAL: Weights file not found!\nExpected at: {weights_path}")
+            missing_files = []
+            for path in [lc_weights_path, gan_weights_path, cd_weights_path]:
+                if not os.path.exists(path):
+                    missing_files.append(os.path.basename(path))
+
+            if missing_files:
+                raise FileNotFoundError(f"Missing required model files: {', '.join(missing_files)}")
+
+        except Exception as e:
+            self.show_error(f"FATAL: Could not find model files.\n{e}")
             self.analysis_finished(None)
             return
-
-        self.worker = Worker(sar_path, optical_path, weights_path)
+        
+        self.worker = Worker(sar_path, optical_path, lc_weights_path, gan_weights_path, cd_weights_path)
         self.worker.progress.connect(self.update_progress)
         self.worker.finished.connect(self.analysis_finished)
         self.worker.error.connect(self.show_error)

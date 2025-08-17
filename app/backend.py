@@ -1,28 +1,36 @@
+import argparse
 import glob
 import io
 import math
 import os
 import re
+import shutil
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import matplotlib
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
 import segmentation_models_pytorch as smp
 import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 from rasterio.crs import CRS
 from rasterio.transform import from_origin
 from rasterio.warp import Resampling, calculate_default_transform, reproject
 from scipy.ndimage import uniform_filter
+from torchvision.utils import save_image
+
+from cd_dependencies import utils
+from cd_dependencies.models.evaluator import CDEvaluator
 
 matplotlib.use("Agg")
-import sys
-
-import matplotlib.patches as mpatches
-import matplotlib.pyplot as plt
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -118,7 +126,7 @@ def convert_tiles_inplace(tile_dir: str, is_mask: bool = False, progress_callbac
         return
 
     for i, tif_path in enumerate(tif_paths):
-        reporter.report(f"PROGRESS:Converting {i + 1}/{total_files} tiles...")
+        reporter.report(f"PROGRESS:Converting tile {i + 1}/{total_files}...")
 
         with rasterio.open(tif_path) as src:
             arr = src.read()
@@ -146,7 +154,7 @@ def convert_tiles_inplace(tile_dir: str, is_mask: bool = False, progress_callbac
         os.remove(tif_path)
 
     reporter.report(
-        f"Finished converting files in {os.path.basename(tile_dir)} to .png"
+        f"Finished converting files in {os.path.basename(tile_dir)} to png."
     )
 
 
@@ -225,11 +233,9 @@ def tile_sar_and_optical(
 
     if contours:
         largest_contour = max(contours, key=cv2.contourArea)
-
         cv2.drawContours(
             binary_mask_reproj, [largest_contour], -1, (255), thickness=cv2.FILLED
         )
-
         reporter.report("Successfully created binary mask from the largest contour.")
     else:
         reporter.report("Warning: No contours found in SAR data to create a mask.")
@@ -260,9 +266,8 @@ def tile_sar_and_optical(
         )
         for row in range(tiles_down):
             for col in range(tiles_across):
-                reporter.report(
-                    f"PROGRESS:Tiling tile {row * tiles_across + col + 1}/{total_tiles}..."
-                )
+                tile_num = row * tiles_across + col + 1
+                reporter.report(f"PROGRESS:Tiling tile {tile_num}/{total_tiles}...")
 
                 tlx = sar_proj_bounds.left + col * (tile_width * pixel_size_meters)
                 tly = sar_proj_bounds.top - row * (tile_height * pixel_size_meters)
@@ -400,10 +405,11 @@ def classify_landcover(
     os.makedirs(output_dir, exist_ok=True)
     image_files = sorted(glob.glob(os.path.join(input_dir, "*.png")))
     transform = InferenceTransform()
+    total_files = len(image_files)
 
     with torch.no_grad():
         for i, img_path in enumerate(image_files):
-            reporter.report(f"PROGRESS:Processing tile {i + 1}/{len(image_files)}...")
+            reporter.report(f"PROGRESS:Classifying tile {i + 1}/{total_files}...")
             image = Image.open(img_path).convert("RGB")
             input_tensor = transform(image).unsqueeze(0).to(DEVICE)
             logits = model(input_tensor)
@@ -416,68 +422,229 @@ def classify_landcover(
     return output_dir
 
 
-def detect_change_dummy(
-    pre_event_dir: str, post_event_dir: str, base_temp_dir: str, progress_callback=None
-) -> str:
-    reporter.set_callback(progress_callback)
-    reporter.report("\nStarting Real Change Detection...")
-
-    # --- Path Definitions ---
-    backend_dir = os.path.dirname(__file__)
-    cd_dependencies_dir = os.path.join(backend_dir, "cd_dependencies")
-    gan_weights_file = os.path.join(cd_dependencies_dir, "mod", "ganmodel.pth")
-    # Using 'best_ckpt.pt' as confirmed during our debugging.
-    cd_weights_file = os.path.join(cd_dependencies_dir, "mod", "changemodel.pt")
-    cd_script_output_dir = os.path.join(base_temp_dir, "cd_script_output")
-
-    for path in [cd_dependencies_dir, gan_weights_file, cd_weights_file]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Required file/dir for change detection not found: {path}"
-            )
-
-    # Temporarily add the cd_dependencies directory to Python's path for the import
-    sys.path.insert(0, cd_dependencies_dir)
-
-    try:
-        from fullPredict import main as full_predict_main
-
-        reporter.report("Successfully imported 'fullPredict' module.")
-
-        args_list = [
-            "--gan_checkpoint",
-            os.path.abspath(gan_weights_file),
-            "--cd_checkpoint",
-            os.path.abspath(cd_weights_file),
-            "--input_sar_dir",
-            os.path.abspath(post_event_dir),
-            "--input_opt_dir",
-            os.path.abspath(pre_event_dir),
-            "--output_dir",
-            os.path.abspath(cd_script_output_dir),
-        ]
-
-        reporter.report("Starting execution of the change detection pipeline...")
-
-        # --- MODIFICATION: Pass the reporter object directly into the function ---
-        full_predict_main(args_list, reporter=reporter)
-
-    finally:
-        # Always clean up the system path
-        if cd_dependencies_dir in sys.path:
-            sys.path.remove(cd_dependencies_dir)
-
-    reporter.report("Change Detection process finished.")
-
-    final_predictions_dir = os.path.join(
-        os.path.abspath(cd_script_output_dir), "change_detection_results"
-    )
-    if not os.path.isdir(final_predictions_dir):
-        raise NotADirectoryError(
-            f"The expected output directory was not created: {final_predictions_dir}"
+# --- Start: Change Detection Logic ---
+class ResidualBlock(nn.Module):
+    def __init__(self, in_features):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(in_features, in_features, 3),
+            nn.InstanceNorm2d(in_features),
+            nn.ReLU(inplace=True),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(in_features, in_features, 3),
+            nn.InstanceNorm2d(in_features),
         )
 
-    return final_predictions_dir
+    def forward(self, x):
+        return x + self.block(x)
+
+
+class Generator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3, num_res_blocks=9):
+        super().__init__()
+        self.input_conv = nn.Sequential(
+            nn.ReflectionPad2d(3),
+            nn.Conv2d(input_channels, 64, 7),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.down1 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, stride=2, padding=1),
+            nn.InstanceNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(256) for _ in range(num_res_blocks)]
+        )
+        self.up1 = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.up2 = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.output = nn.Sequential(
+            nn.ReflectionPad2d(3), nn.Conv2d(64, output_channels, 7), nn.Tanh()
+        )
+
+    def forward(self, x):
+        x = self.input_conv(x)
+        x = self.down1(x)
+        x = self.down2(x)
+        x = self.res_blocks(x)
+        x = self.up1(x)
+        x = self.up2(x)
+        return self.output(x)
+
+
+class CycleGANPredictor:
+    def __init__(self, checkpoint_path, num_res_blocks=9):
+        self.device = DEVICE
+        reporter.report(f"Using device: {self.device}")
+        self.G_AB = Generator(
+            input_channels=3, output_channels=3, num_res_blocks=num_res_blocks
+        ).to(self.device)
+        self.load_checkpoint(checkpoint_path)
+        self.G_AB.eval()
+        self.transform = transforms.Compose(
+            [
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+            ]
+        )
+
+    def load_checkpoint(self, checkpoint_path):
+        if not os.path.exists(checkpoint_path):
+            raise FileNotFoundError(f"GAN Checkpoint not found at {checkpoint_path}")
+        reporter.report(f"Loading GAN checkpoint...")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        if "G_AB" in checkpoint:
+            self.G_AB.load_state_dict(checkpoint["G_AB"])
+            reporter.report("Loaded GAN weights successfully.")
+        else:
+            reporter.report(
+                "Warning: 'G_AB' not found in checkpoint. Loading state_dict directly."
+            )
+            self.G_AB.load_state_dict(checkpoint)
+
+    def predict_single_image(self, image_path):
+        image = Image.open(image_path).convert("RGB")
+        image_tensor = self.transform(image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            translated = self.G_AB(image_tensor)
+        return translated
+
+    def predict_batch(self, input_dir, output_dir):
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        image_files = sorted(list(Path(input_dir).glob("*.png")))
+        total_files = len(image_files)
+
+        if not image_files:
+            reporter.report(f"No images found in {input_dir}. Exiting GAN prediction.")
+            return
+
+        for i, image_path in enumerate(image_files):
+            reporter.report(
+                f"PROGRESS:Translating tile {i + 1}/{total_files}..."
+            )
+            translated = self.predict_single_image(str(image_path))
+            if translated is not None:
+                normalized_tensor = (translated.squeeze(0).cpu() + 1.0) / 2.0
+                save_image(
+                    normalized_tensor,
+                    str(output_path / image_path.name),
+                    normalize=False,
+                )
+
+
+def save_tensor_as_png(tensor, filepath):
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    pred_mask = torch.argmax(tensor, dim=0).float()
+    save_image(pred_mask.unsqueeze(0), filepath)
+
+
+def detect_change(
+    pre_event_dir: str,
+    post_event_dir: str,
+    gan_weights_path: str,
+    cd_weights_path: str,
+    base_temp_dir: str,
+    progress_callback=None,
+) -> str:
+    reporter.set_callback(progress_callback)
+    reporter.report("\nStarting change detection...")
+
+    if not os.path.exists(gan_weights_path):
+        raise FileNotFoundError(f"GAN weights not found: {gan_weights_path}")
+    if not os.path.exists(cd_weights_path):
+        raise FileNotFoundError(f"Change detection weights not found: {cd_weights_path}")
+
+    reporter.report("Starting CycleGAN Prediction...")
+    gan_output_dir = os.path.join(base_temp_dir, "gan_translated_images")
+    gan_predictor = CycleGANPredictor(checkpoint_path=gan_weights_path)
+    gan_predictor.predict_batch(pre_event_dir, gan_output_dir)
+    reporter.report("CycleGAN Prediction Complete.")
+
+    reporter.report("Preparing data for Change Detection model...")
+    base_cd_dir = os.path.join(base_temp_dir, "cd_data")
+    cd_A_dir = os.path.join(base_cd_dir, "A")
+    cd_B_dir = os.path.join(base_cd_dir, "B")
+    cd_label_dir = os.path.join(base_cd_dir, "label")
+
+    os.makedirs(cd_A_dir, exist_ok=True)
+    os.makedirs(cd_B_dir, exist_ok=True)
+    os.makedirs(cd_label_dir, exist_ok=True)
+
+    file_list = [f for f in os.listdir(gan_output_dir) if f.endswith(".png")]
+    dummy_label_image = Image.fromarray(np.zeros((256, 256), dtype=np.uint8))
+
+    for filename in file_list:
+        shutil.copy2(os.path.join(gan_output_dir, filename), os.path.join(cd_A_dir, filename))
+        shutil.copy2(os.path.join(post_event_dir, filename), os.path.join(cd_B_dir, filename))
+        dummy_label_image.save(os.path.join(cd_label_dir, filename))
+    reporter.report("Data preparation complete.")
+
+    cd_args = SimpleNamespace(
+        checkpoint_dir=str(Path(cd_weights_path).parent),
+        name="ChangeDetection",
+        net_G="base_transformer_pos_s4",
+        n_class=2,
+        gpu_ids=[],
+        data_name="custom",
+        img_size=256,
+        batch_size=1,
+        isTrain=False,
+        t1_source="A",
+        t2_source="B",
+        custom_data_root=base_cd_dir,
+        init_type="normal",
+        init_gain=0.02,
+    )
+
+    cd_dataloader = utils.get_loader(
+        data_name=cd_args.data_name,
+        img_size=cd_args.img_size,
+        batch_size=cd_args.batch_size,
+        is_train=False,
+        t1_source=cd_args.t1_source,
+        t2_source=cd_args.t2_source,
+        custom_data_root=cd_args.custom_data_root,
+    )
+
+    cd_evaluator = CDEvaluator(args=cd_args, dataloader=cd_dataloader)
+    cd_evaluator._load_checkpoint(checkpoint_name=os.path.basename(cd_weights_path))
+    cd_evaluator.net_G.to(DEVICE)
+    cd_evaluator.net_G.eval()
+
+    reporter.report("Change detection model loaded and set to evaluation mode.")
+    total_pairs = len(cd_dataloader.dataset)
+
+    cd_output_dir = os.path.join(base_temp_dir, "change_detection_results")
+    os.makedirs(cd_output_dir, exist_ok=True)
+
+    for i, data in enumerate(cd_dataloader):
+        reporter.report(f"PROGRESS:Detecting change in tile {i + 1}/{total_pairs}...")
+        t1_tensor = data["A"].to(DEVICE)
+        t2_tensor = data["B"].to(DEVICE)
+        with torch.no_grad():
+            _, _, cd_output = cd_evaluator.net_G(t1_tensor, t2_tensor)
+        filename = data["name"][0]
+        output_filepath = os.path.join(cd_output_dir, filename)
+        save_tensor_as_png(cd_output.squeeze(0).cpu(), output_filepath)
+
+    reporter.report("Change detection prediction complete.")
+    return cd_output_dir
 
 
 def combine_and_stitch_results(
@@ -486,30 +653,30 @@ def combine_and_stitch_results(
     mask_dir: str,
     base_temp_dir: str,
     progress_callback=None,
-) -> str:
+) -> Image.Image:
     reporter.set_callback(progress_callback)
 
     reporter.report("\nStarting final combination and stitching...")
     combined_dir = os.path.join(base_temp_dir, "combined_tiles")
     os.makedirs(combined_dir, exist_ok=True)
     lc_tiles = sorted(glob.glob(os.path.join(lc_pred_dir, "*.png")))
+    total_tiles = len(lc_tiles)
 
     for i, lc_path in enumerate(lc_tiles):
-        reporter.report(f"PROGRESS:Combining tile {i + 1}/{len(lc_tiles)}...")
+        reporter.report(f"PROGRESS:Combining tile {i + 1}/{total_tiles}...")
 
         filename = os.path.basename(lc_path)
         cd_path = os.path.join(cd_pred_dir, filename)
         mask_path = os.path.join(mask_dir, filename)
         if not all(os.path.exists(p) for p in [cd_path, mask_path]):
+            reporter.report(f"Skipping {filename}, missing a corresponding file.")
             continue
 
         lc_array = np.array(Image.open(lc_path).convert("RGB"))
-        cd_array = np.array(Image.open(cd_path).convert("RGB"))
+        cd_mono_array = np.array(Image.open(cd_path).convert("L"))
         mask_array = np.array(Image.open(mask_path).convert("RGB"))
 
-        final_array = lc_array.copy()
-        is_flooded_mask = np.any(cd_array != [0, 0, 0], axis=-1)
-
+        is_flooded_mask = cd_mono_array > 0
         final_array = np.zeros_like(lc_array)
         final_array[is_flooded_mask] = lc_array[is_flooded_mask]
 
@@ -519,13 +686,15 @@ def combine_and_stitch_results(
         Image.fromarray(final_array).save(os.path.join(combined_dir, filename))
     reporter.report("Finished combining tiles.")
 
-    reporter.report("\nStitching combined tiles into a single image...")
+    reporter.report("Stitching combined tiles into a single image...")
     combined_tiles = sorted(glob.glob(os.path.join(combined_dir, "*.png")))
     if not combined_tiles:
         reporter.report("No combined tiles were created. Cannot stitch.")
-        return ""
+        return None
+
     tile_coords = [
-        re.match(r"tile_(\d+)_(\d+)\.png", os.path.basename(p)) for p in combined_tiles
+        re.match(r"tile_(\d+)_(\d+)\.png", os.path.basename(p))
+        for p in combined_tiles
     ]
     valid_tiles = [tc.groups() for tc in tile_coords if tc]
     max_row = max(int(r) for r, c in valid_tiles)
@@ -538,10 +707,10 @@ def combine_and_stitch_results(
     full_height = (max_row + 1) * tile_h
     stitched_image = Image.new("RGB", (full_width, full_height))
     reporter.report(f"Creating a {full_width}x{full_height} canvas...")
+    total_combined = len(combined_tiles)
 
     for i, tile_path in enumerate(combined_tiles):
-        reporter.report(f"PROGRESS:Stitching tile {i + 1}/{len(combined_tiles)}...")
-
+        reporter.report(f"PROGRESS:Stitching tile {i + 1}/{total_combined}...")
         match = re.match(r"tile_(\d+)_(\d+)\.png", os.path.basename(tile_path))
         if match:
             row, col = map(int, match.groups())
@@ -549,7 +718,6 @@ def combine_and_stitch_results(
                 stitched_image.paste(tile, (col * tile_w, row * tile_h))
 
     reporter.report("Stitching complete.")
-
     return stitched_image
 
 
@@ -596,7 +764,6 @@ def calculate_statistics(stitched_image: Image.Image, pixel_size_meters: float) 
         return {}
 
     image_array = np.array(stitched_image.convert("RGB"))
-
     pixel_area_m2 = pixel_size_meters * pixel_size_meters
     m2_to_km2 = 1 / 1_000_000
 
@@ -608,7 +775,6 @@ def calculate_statistics(stitched_image: Image.Image, pixel_size_meters: float) 
     total_path_pixels = np.sum(flight_path_mask)
 
     is_black_mask = np.all(image_array == black_color, axis=-1)
-
     non_flooded_pixels = np.sum(is_black_mask & flight_path_mask)
     total_flooded_pixels = total_path_pixels - non_flooded_pixels
 
@@ -622,21 +788,18 @@ def calculate_statistics(stitched_image: Image.Image, pixel_size_meters: float) 
     for class_id, color_rgb in INDEX_TO_COLOR.items():
         class_label = CLASS_ID_TO_LABEL.get(class_id, f"Unknown Class {class_id}")
         color_np = np.array(list(color_rgb))
-
         class_mask = np.all(image_array == color_np, axis=-1) & flight_path_mask
         pixel_count = np.sum(class_mask)
-
         area_km2 = pixel_count * pixel_area_m2 * m2_to_km2
         land_cover_stats[class_label] = area_km2
 
     stats["land_cover_areas_km2"] = land_cover_stats
     reporter.report("Statistics calculation complete.")
-
     return stats
 
 
 def generate_legend_image(stats: dict) -> Image.Image:
-    reporter.report("\nGenerating legend image...")
+    reporter.report("Generating legend image...")
     if not stats:
         return None
 
@@ -652,9 +815,7 @@ def generate_legend_image(stats: dict) -> Image.Image:
     )
 
     label_to_id = {v: k for k, v in CLASS_ID_TO_LABEL.items()}
-
-    row_height = 0.35
-    header_space = 0.6
+    row_height, header_space = 0.35, 0.6
     num_items = 3 + len(sorted_land_cover)
     fig_height = (num_items + 2) * row_height
     fig_width = 4.8
@@ -663,12 +824,12 @@ def generate_legend_image(stats: dict) -> Image.Image:
     fig.patch.set_facecolor("#FAFAFA")
     ax.set_facecolor("#FAFAFA")
     ax.axis("off")
-
     y_pos = fig_height - header_space
 
     def draw_row(label, value=None, color=None, bold=False):
         nonlocal y_pos
         rect_height = 0.25
+        text_x = 0.55 if color else 0.2
         if color:
             rect = mpatches.Rectangle(
                 (0.2, y_pos - rect_height / 2),
@@ -679,10 +840,6 @@ def generate_legend_image(stats: dict) -> Image.Image:
                 linewidth=0.5,
             )
             ax.add_patch(rect)
-            text_x = 0.55
-        else:
-            text_x = 0.2
-
         ax.text(
             text_x,
             y_pos,
@@ -692,7 +849,6 @@ def generate_legend_image(stats: dict) -> Image.Image:
             fontsize=9,
             weight="bold" if bold else "normal",
         )
-
         if value is not None:
             ax.text(
                 fig_width - 0.2,
@@ -703,12 +859,10 @@ def generate_legend_image(stats: dict) -> Image.Image:
                 fontsize=9,
                 weight="bold" if bold else "normal",
             )
-
         y_pos -= row_height
 
     draw_row("Total Area (Flight Path)", total_area, bold=True)
     draw_row("Total Flooded Area", flooded_area, bold=True)
-
     draw_row("Non-Flooded Area", non_flooded_area, color="#000000")
 
     y_pos -= 0.15
@@ -725,17 +879,14 @@ def generate_legend_image(stats: dict) -> Image.Image:
             va="center",
             fontsize=9,
             style="italic",
-            color="#000000",
         )
         y_pos -= row_height
-
         for label, area in sorted_land_cover:
             class_id = label_to_id.get(label)
-            if class_id:
-                rgb = INDEX_TO_COLOR.get(class_id)
-                if rgb:
-                    color_hex = "#%02x%02x%02x" % rgb
-                    draw_row(label, area, color=color_hex)
+            if class_id and class_id in INDEX_TO_COLOR:
+                rgb = INDEX_TO_COLOR[class_id]
+                color_hex = "#%02x%02x%02x" % rgb
+                draw_row(label, area, color=color_hex)
 
     buf = io.BytesIO()
     plt.savefig(
@@ -756,7 +907,9 @@ def generate_legend_image(stats: dict) -> Image.Image:
 def run_flood_mapping_pipeline(
     sar_tif: str,
     optical_tif: str,
-    weights_file: str,
+    lc_weights_file: str,
+    gan_weights_file: str,
+    cd_weights_file: str,
     progress_callback=None,
     tile_width: int = 256,
     tile_height: int = 256,
@@ -767,8 +920,6 @@ def run_flood_mapping_pipeline(
 
     with tempfile.TemporaryDirectory() as temp_dir:
         reporter.report(f"Created temporary directory: {temp_dir}")
-
-        stitched_image, legend_image = None, None
 
         sar_tiles_dir, opt_tiles_dir, mask_tiles_dir = tile_sar_and_optical(
             sar_tif,
@@ -782,14 +933,16 @@ def run_flood_mapping_pipeline(
 
         lc_pred_dir = classify_landcover(
             input_dir=sar_tiles_dir,
-            weights_path=weights_file,
+            weights_path=lc_weights_file,
             base_temp_dir=temp_dir,
             progress_callback=progress_callback,
         )
 
-        cd_pred_dir = detect_change_dummy(
+        cd_pred_dir = detect_change(
             pre_event_dir=opt_tiles_dir,
             post_event_dir=sar_tiles_dir,
+            gan_weights_path=gan_weights_file,
+            cd_weights_path=cd_weights_file,
             base_temp_dir=temp_dir,
             progress_callback=progress_callback,
         )
@@ -802,6 +955,7 @@ def run_flood_mapping_pipeline(
             progress_callback=progress_callback,
         )
 
+        legend_image = None
         if isinstance(stitched_image, Image.Image):
             stats = calculate_statistics(stitched_image, pixel_size_meters)
             if stats:
@@ -810,72 +964,61 @@ def run_flood_mapping_pipeline(
         if output_dir:
             final_output_path, legend_output_path = None, None
             if stitched_image:
-                base_name = (
-                    os.path.splitext(os.path.basename(sar_tif))[0] + "_flood_map.png"
-                )
+                base_name = f"{Path(sar_tif).stem}_flood_map.png"
                 final_output_path = os.path.join(output_dir, base_name)
                 save_stitched_image(
                     stitched_image, final_output_path, progress_callback
                 )
-
             if legend_image:
-                legend_base_name = (
-                    os.path.splitext(os.path.basename(sar_tif))[0] + "_legend.png"
-                )
+                legend_base_name = f"{Path(sar_tif).stem}_legend.png"
                 legend_output_path = os.path.join(output_dir, legend_base_name)
                 save_legend_image(legend_image, legend_output_path, progress_callback)
-
             reporter.report("\nPipeline finished successfully!")
             return (final_output_path, legend_output_path)
-        else:
-            reporter.report(
-                "\nPipeline finished successfully! No output_dir provided, returning image objects."
-            )
-            return (stitched_image, legend_image)
+
+        reporter.report(
+            "\nPipeline finished successfully! Returning image objects."
+        )
+        return (stitched_image, legend_image)
 
 
 if __name__ == "__main__":
-    import argparse
-
     parser = argparse.ArgumentParser(
         description="Detect flooded areas using SAR and optical imagery and classify land cover in the affected regions."
     )
-    parser.add_argument("sar_tif", help="Path to the SAR (flight path) .tif")
-    parser.add_argument("optical_tif", help="Path to the optical .tif")
+    parser.add_argument("sar_tif", help="Path to the SAR (post-event) .tif")
+    parser.add_argument("optical_tif", help="Path to the optical (pre-event) .tif")
     parser.add_argument(
-        "weights_file",
-        help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth)",
+        "lc_weights_file",
+        help="Path to the land cover model weights file (e.g., Segformer.pth)",
+    )
+    parser.add_argument(
+        "gan_weights_file",
+        help="Path to the CycleGAN generator weights file (e.g., ganmodel.pth)",
+    )
+    parser.add_argument(
+        "cd_weights_file",
+        help="Path to the Change Detection model weights file (e.g., changemodel.pt)",
     )
     parser.add_argument(
         "--output-dir",
         dest="output_dir",
         default=None,
-        help="Directory to save the final flood map image",
-    )
-    parser.add_argument(
-        "optical_tif", help="Path to the optical GeoTIFF for the same area."
-    )
-    parser.add_argument(
-        "weights_file",
-        help="Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        dest="output_dir",
-        default=None,
-        help="Directory where outputs will be saved. If provided, two PNGs are written: a stitched flood map and a legend. If omitted, the CLI will display the images.",
+        help="Directory where outputs will be saved. If provided, PNGs are written. If omitted, the final images will be displayed.",
     )
     args = parser.parse_args()
 
     final_map, legend_map = run_flood_mapping_pipeline(
         sar_tif=args.sar_tif,
         optical_tif=args.optical_tif,
-        weights_file=args.weights_file,
+        lc_weights_file=args.lc_weights_file,
+        gan_weights_file=args.gan_weights_file,
+        cd_weights_file=args.cd_weights_file,
         output_dir=args.output_dir,
     )
 
     if args.output_dir:
-        print(f"Outputs saved: Map='{final_map}', Legend='{legend_map}'")
+        print(f"\nOutputs saved: Map='{final_map}', Legend='{legend_map}'")
     else:
         if final_map:
             final_map.show()

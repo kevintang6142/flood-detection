@@ -10,7 +10,7 @@ from torch.nn.parameter import Parameter
 from torch.nn.modules.module import Module
 from torch import nn
 import torch
-from models.laplace import EA,make_laplace_pyramid
+from .laplace import EA,make_laplace_pyramid
 from torchvision.transforms.functional import rgb_to_grayscale
 __all__ = ['DOConv2d']
 

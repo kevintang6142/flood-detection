@@ -19,7 +19,7 @@ The pipeline:
 1) Reproject SAR to a meter-based CRS and apply a Refined Lee filter.
 2) Tile SAR and optical images to fixed-size PNGs for model input.
 3) Run land cover segmentation using SegFormer with custom weights.
-4) Perform change detection over pre-/post-event imagery (placeholder or model-based).
+4) Perform change detection over pre-/post-event imagery.
 5) Combine and stitch tiles; compute summary statistics and render a legend.
 
 ## Repository structure
@@ -116,10 +116,12 @@ If using pip/venv, replace `uv run` with `python` (or `python3` on macOS/Linux).
 Positional arguments (required):
 - `sar_tif` (path): Path to the SAR (flight path) GeoTIFF.
 - `optical_tif` (path): Path to the optical GeoTIFF for the same area.
-- `weights_file` (path): Path to the land cover model weights file (e.g., SegformerJaccardLoss.pth).
+- `lc_weights_file` (path): Path to the land cover model weights file (e.g., app/SegformerJaccardLoss.pth).
+- `gan_weights_file` (path): Path to the CycleGAN model weights file (e.g., app/ganmodel.pth).
+- `cd_weights_file` (path): Path to the change detection model weights file (e.g., app/changemodel.pt).
 
 Optional arguments:
-- `--output-dir OUTPUT_DIR` (path): Directory where outputs will be saved. If provided, two PNGs are written: a stitched flood map and a legend. If omitted, the CLI will display the images.
+- `--output-dir OUTPUT_DIR` (path): Directory where outputs will be saved. If provided, two PNGs are written: a flood map and a legend. If omitted, the CLI will display the images.
 - Output filenames are derived from the SAR filename: `<sar_base>_flood_map.png` and `<sar_base>_legend.png`.
 
 
@@ -144,6 +146,10 @@ uv run pyinstaller app/FloodMapperMacOS.spec
 If using pip/venv, remove `uv run`.
 
 Artifacts will be created under `app/build/` and `app/dist/`.
+
+## Acknowledgements
+
+The change detection model integrated into this project is based on the work from the [ChangeDetection-GLCD-DA](https://github.com/WHU-SGG-RS-Pro-Group/ChangeDetection-GLCD-DA) repository. We thank the authors for making their code publicly available.
 
 ## License
 

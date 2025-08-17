@@ -50,7 +50,7 @@ def get_loaders(args):
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers if hasattr(args, "num_workers") else 4,
-        pin_memory=True,
+        # pin_memory=True,
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -58,7 +58,7 @@ def get_loaders(args):
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers if hasattr(args, "num_workers") else 4,
-        pin_memory=True,
+        # pin_memory=True,
     )
 
     return {"train": train_loader, "val": val_loader}
@@ -77,8 +77,8 @@ def get_loader(
     """
     Get single dataloader (e.g., for testing)
     """
-    from datasets.CD_dataset import CDDataset
-    from datasets.data_config import DataConfig
+    from .datasets.CD_dataset import CDDataset
+    from .datasets.data_config import DataConfig
 
     data_config = DataConfig().get_data_config(data_name)
 
@@ -104,7 +104,7 @@ def get_loader(
         batch_size=batch_size,
         shuffle=is_train,
         num_workers=4,
-        pin_memory=True,
+        # pin_memory=True,
         drop_last=True,
     )
 

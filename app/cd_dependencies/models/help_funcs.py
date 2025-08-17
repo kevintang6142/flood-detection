@@ -4,7 +4,7 @@ from einops import rearrange
 from torch import nn
 import numpy as np
 
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 class TwoLayerConv2d(nn.Sequential):
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__(nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size,
